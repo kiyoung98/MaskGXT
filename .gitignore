@@ -1,0 +1,21 @@
+# Data (regenerate with prepare.py)
+/data/
+
+# Training runs, checkpoints, generated samples
+/runs/
+*.ckpt
+best.pt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# NOTE: precompute/*.pt artifacts ARE committed (small, dataset-pinned).
