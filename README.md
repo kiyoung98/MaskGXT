@@ -1,6 +1,7 @@
 # MaskGXT
 
 [![arXiv](https://img.shields.io/badge/arXiv-2606.22866-b31b1b.svg)](https://arxiv.org/abs/2606.22866)
+[![Blog](https://img.shields.io/badge/Blog-MaskGXT-blue.svg)](https://sungsoo-ahn.github.io/blog/2026/maskgxt-ai-coscientist/)
 
 Crystal structure prediction by masked generative modeling. Developed by an AI
 co-scientist, [HACO](https://github.com/kiyoung98/HACO).
@@ -10,6 +11,9 @@ atoms in the unit cell), predict its stable crystal structure — the lattice an
 the atomic positions. A composition can have several stable structures
 (polymorphs), so we measure both single-structure accuracy (match rate) and
 polymorph coverage (METRe).
+
+Explore crystal structures sampled by MaskGXT from the MP-20 polymorph split
+test set at **[kiyoung98.github.io/MaskGXT](https://kiyoung98.github.io/MaskGXT/)**.
 
 ![overview](assets/overview.png)
 
