@@ -6,11 +6,14 @@
 Crystal structure prediction by masked generative modeling. Developed by an AI
 co-scientist, [HACO](https://github.com/kiyoung98/HACO).
 
-**Task.** Crystal structure prediction (CSP): given a chemical composition (the
-atoms in the unit cell), predict its stable crystal structure — the lattice and
-the atomic positions. A composition can have several stable structures
-(polymorphs), so we measure both single-structure accuracy (match rate) and
-polymorph coverage (METRe).
+**Task.** Crystal structure prediction (CSP).
+
+- **Input:** a chemical composition (the atoms in the unit cell).
+- **Output:** the stable crystal structure — the lattice and the atomic positions.
+- **Metrics:** a composition can have several stable structures (polymorphs), so
+  we measure both
+  - *single-structure accuracy* — one-to-one match rate / RMSE, and
+  - *polymorph coverage* — METRe / cRMSE.
 
 Explore crystal structures sampled by MaskGXT from the MP-20 polymorph split
 test set at **[kiyoung98.github.io/MaskGXT](https://kiyoung98.github.io/MaskGXT/)**.
@@ -44,14 +47,29 @@ python train.py --dataset mp_20 --run_name mp20
 python sample.py --dataset mp_20 --greedy --ckpt runs/mp20/best.pt   # match rate
 python sample.py --dataset mp_20 --greedy --sg_stratify --ckpt runs/mp20/best.pt  # METRe
 
-# 4. score (METRe match rate + cRMSE)
+# 4. score (prints both metric families, see below)
 python evaluate.py --samples_dir runs/mp20/<decode tag>_samples --dataset mp_20
 ```
 
-**Sampling flags** (independent): `--greedy` = MAP/argmax decoding;
-`--sg_stratify` = assign distinct space groups across a composition's
-generations for polymorph coverage. The Wyckoff/SG tables under `precompute/`
-are committed; regenerate with `precompute_normalizer.py` / `precompute_wyckoff.py`.
+**Sampling flags** (independent):
+
+- `--greedy` — MAP/argmax decoding (one CIF per test entry, index-aligned).
+- `--sg_stratify` — assign distinct space groups across a composition's
+  generations, for polymorph coverage.
+
+The Wyckoff/SG tables under `precompute/` are committed; regenerate with
+`precompute_normalizer.py` / `precompute_wyckoff.py`.
+
+**`evaluate.py` metrics** (tolerances `ltol=0.3, stol=0.5, angle_tol=10°`):
+
+- **METRe / cRMSE** — composition-pooled coverage (paper Table 2). Score the
+  `--sg_stratify` samples.
+- **One-to-one match rate / RMSE** — index-aligned, each test ref vs its single
+  generation (paper Table 1). Score the `--greedy` samples. Reported twice:
+  - *Unfiltered* — applied directly to the generations.
+  - *Filtered* — a generation is unmatched if it fails CDVAE SMACT/structural
+    validity. Needs `smact==2.6`; SMACT ≥ 4 changes oxidation tables and breaks
+    reproduction.
 
 ## Citation
 

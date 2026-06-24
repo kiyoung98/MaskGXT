@@ -3,6 +3,7 @@ torch==2.5.1+cu121
 torch_geometric>=2.5
 pymatgen>=2024.1
 lmdb>=1.4
-numpy>=1.24
+numpy>=1.24,<2     # smact 2.6 requires numpy<2
 tqdm>=4.65
 pyxtal>=0.6        # Wyckoff/space-group tables (precompute_*.py)
+smact==2.6         # validity-filtered match rate; pin 2.6 (smact>=4 changes the result)

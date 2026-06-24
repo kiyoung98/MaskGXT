@@ -1,14 +1,14 @@
 """Score a MaskGXT submission from a directory of CIF samples.
 
-``sample.py`` (and ``train.py`` during validation) writes one CIF per reference
-entry to ``<out_dir>/{idx:05d}.cif``, indexed by the order of the reference
-``.pt`` split. This script loads those CIFs, builds the reference set from the
-ground-truth ``.pt`` tensors, and computes the full METRe metric set at the
-fixed tolerances (``stol=0.5, ltol=0.3, angle_tol=10.0``).
+``sample.py`` writes one CIF per reference entry to ``<out_dir>/{idx:05d}.cif``,
+indexed by the reference ``.pt`` split order. This script reports two metric
+families at fixed tolerances (``stol=0.5, ltol=0.3, angle_tol=10.0``):
 
-METRe match rate (higher is better, range [0, 1]) is the primary metric; cRMSE
-(lower is better) and mean_rmsd (precision when matched) are reported as
-diagnostics.
+  * METRe / cRMSE (composition-pooled; paper Table 2).
+  * one-to-one match rate + RMSE (index-aligned; paper Table 1), both
+    ``Unfiltered`` and ``Filtered`` (drops generations failing CDVAE validity).
+
+Filtered match rate requires ``smact==2.6``.
 
 Usage:
     # by dataset name (reference = test split by default)
@@ -30,9 +30,25 @@ from typing import Optional, Sequence
 import numpy as np
 import torch
 from tqdm import tqdm
+from collections import Counter
+
 from pymatgen.analysis.structure_matcher import StructureMatcher
 from pymatgen.core import Lattice, Structure
 from pymatgen.io.cif import CifParser
+
+# smact is only needed for the validity-filtered match rate; defer the import
+# error to point-of-use so the other metrics work without it. Pin smact==2.6.
+try:
+    import itertools
+
+    import smact
+    from smact.screening import pauling_test
+
+    _SMACT_IMPORT_ERROR: Optional[Exception] = None
+except Exception as _e:  # pragma: no cover - environment dependent
+    smact = None
+    pauling_test = None
+    _SMACT_IMPORT_ERROR = _e
 
 
 # --- METRe match rate (and diagnostic RMSD/cRMSE) ----------------------------
@@ -252,19 +268,222 @@ def _ref_from_record(rec) -> CrystalRecord:
     )
 
 
-def _gen_from_cif(path: Path) -> CrystalRecord:
-    """Build a generated CrystalRecord from a CIF file.
+def _struct_from_cif(path: Path) -> Structure:
+    """Parse a generated CIF into a pymatgen Structure (raises on bad CIFs)."""
+    return CifParser(str(path)).parse_structures(primitive=False)[0]
 
-    Uses pymatgen's default ``occupancy_tolerance``. If a CIF can't be
-    parsed (e.g. atoms collapsed to identical fractional coords ->
-    occupancy > tolerance, or a lattice axis collapsed below the
-    minimum-thickness threshold), this raises; the caller catches and
-    skips that gen from the matching pool. METRe's per-composition
-    matching makes the absence a graceful "no candidate" rather than a
-    hard error.
-    """
-    struct = CifParser(str(path)).parse_structures(primitive=False)[0]
+
+def _gen_from_cif(path: Path) -> CrystalRecord:
+    """Build a generated METRe CrystalRecord from a CIF file."""
+    struct = _struct_from_cif(path)
     return CrystalRecord(struct, struct.atomic_numbers)
+
+
+# --- one-to-one CSP match rate (paper Table 1) -------------------------------
+# Index-aligned matching (gen i vs ref i), unfiltered and validity-filtered.
+# Vendored from crystalite (FlowMM / CDVAE lineage): ``smact_validity`` /
+# ``structure_validity`` / ``Crystal`` (src/eval/crystal.py) and ``RecEval``
+# (src/eval/csp_eval.py).
+
+_MATCH_MAX_Z = 94  # CDVAE atom-type upper bound for validity
+
+# Element symbol per atomic number (index 0 = "X" placeholder).
+_CHEMICAL_SYMBOLS = [
+    "X", "H", "He", "Li", "Be", "B", "C", "N", "O", "F", "Ne", "Na", "Mg",
+    "Al", "Si", "P", "S", "Cl", "Ar", "K", "Ca", "Sc", "Ti", "V", "Cr", "Mn",
+    "Fe", "Co", "Ni", "Cu", "Zn", "Ga", "Ge", "As", "Se", "Br", "Kr", "Rb",
+    "Sr", "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd", "In",
+    "Sn", "Sb", "Te", "I", "Xe", "Cs", "Ba", "La", "Ce", "Pr", "Nd", "Pm",
+    "Sm", "Eu", "Gd", "Tb", "Dy", "Ho", "Er", "Tm", "Yb", "Lu", "Hf", "Ta",
+    "W", "Re", "Os", "Ir", "Pt", "Au", "Hg", "Tl", "Pb", "Bi", "Po", "At",
+    "Rn", "Fr", "Ra", "Ac", "Th", "Pa", "U", "Np", "Pu", "Am", "Cm", "Bk",
+    "Cf", "Es", "Fm", "Md", "No", "Lr", "Rf", "Db", "Sg", "Bh", "Hs", "Mt",
+    "Ds", "Rg", "Cn", "Nh", "Fl", "Mc", "Lv", "Ts", "Og",
+]
+
+
+def _smact_validity(comp, count, use_pauling_test=True, include_alloys=True,
+                    allow_missing_ox_states=False):
+    """SMACT charge-balance + electronegativity validity of a composition."""
+    if smact is None:
+        raise ImportError(
+            f"smact required for the filtered match rate ({_SMACT_IMPORT_ERROR}); "
+            "install `smact==2.6`."
+        )
+    elem_symbols = tuple([_CHEMICAL_SYMBOLS[elem] for elem in comp])
+    space = smact.element_dictionary(elem_symbols)
+    smact_elems = [e[1] for e in space.items()]
+    electronegs = [e.pauling_eneg for e in smact_elems]
+    ox_combos = []
+    for elem in smact_elems:
+        ox_states = elem.oxidation_states
+        if not ox_states:
+            return True if allow_missing_ox_states else False
+        ox_combos.append(ox_states)
+    if len(set(elem_symbols)) == 1:
+        return True
+    if include_alloys:
+        is_metal_list = [elem_s in smact.metals for elem_s in elem_symbols]
+        if all(is_metal_list):
+            return True
+
+    threshold = np.max(count)
+    oxn = 1
+    for oxc in ox_combos:
+        oxn *= len(oxc)
+    if oxn > 1e7:
+        return False
+    for ox_states in itertools.product(*ox_combos):
+        stoichs = [(c,) for c in count]
+        cn_e, cn_r = smact.neutral_ratios(ox_states, stoichs=stoichs, threshold=threshold)
+        if cn_e:
+            if use_pauling_test:
+                try:
+                    electroneg_OK = pauling_test(ox_states, electronegs)
+                except TypeError:
+                    electroneg_OK = True
+            else:
+                electroneg_OK = True
+            if electroneg_OK:
+                return True
+    return False
+
+
+def _structure_validity(crystal, cutoff=0.5):
+    """No two atoms closer than ``cutoff`` A and volume >= 0.1 (CDVAE)."""
+    dist_mat = crystal.distance_matrix
+    dist_mat = dist_mat + np.diag(np.ones(dist_mat.shape[0]) * (cutoff + 10.0))
+    if dist_mat.min() < cutoff or crystal.volume < 0.1:
+        return False
+    return True
+
+
+class MatchCrystal:
+    """A pymatgen Structure plus a CDVAE ``valid`` flag (comp and struct).
+
+    ``compute_validity=False`` keeps ``valid=True`` (unfiltered score, and
+    references, which are ground truth).
+    """
+
+    __slots__ = ("structure", "atom_types", "valid", "comp_valid", "struct_valid")
+
+    def __init__(self, structure: Structure, atomic_numbers: Sequence[int],
+                 compute_validity: bool = False):
+        self.structure = structure
+        self.atom_types = np.asarray(atomic_numbers, dtype=np.int64)
+        if not compute_validity:
+            self.valid = self.comp_valid = self.struct_valid = True
+            return
+        if (self.atom_types < 1).any() or (self.atom_types > _MATCH_MAX_Z).any():
+            self.valid = self.comp_valid = self.struct_valid = False
+            return
+        self.struct_valid = _structure_validity(structure)
+        elem_counter = Counter(int(a) for a in self.atom_types)
+        elems = sorted(elem_counter.keys())
+        counts = np.array([elem_counter[e] for e in elems])
+        counts = counts // np.gcd.reduce(counts)
+        try:
+            self.comp_valid = _smact_validity(tuple(elems), tuple(counts.tolist()))
+        except ImportError:
+            raise
+        except Exception:
+            self.comp_valid = False
+        self.valid = self.comp_valid and self.struct_valid
+
+
+class RecEval:
+    """One-to-one (index-aligned) match rate + RMSE (crystalite ``RecEval``).
+
+    ``preds[i]`` is the single candidate for reference ``gts[i]``; matched iff
+    both are ``valid`` and StructureMatcher returns an RMS distance.
+    ``match_rate`` is over all references (missing/invalid count as misses).
+    """
+
+    def __init__(self, pred_crys, gt_crys, stol=0.5, angle_tol=10.0, ltol=0.3):
+        assert len(pred_crys) == len(gt_crys)
+        self.matcher = StructureMatcher(stol=stol, angle_tol=angle_tol, ltol=ltol)
+        self.preds = pred_crys
+        self.gts = gt_crys
+
+    def process_one(self, pred, gt, is_valid):
+        if not is_valid:
+            return None
+        try:
+            rms_dist = self.matcher.get_rms_dist(pred.structure, gt.structure)
+            if rms_dist is None:
+                return None
+            return rms_dist[0]
+        except Exception:
+            return None
+
+    def get_match_rate_and_rms(self, enable_progress_bar=True, desc="match"):
+        rms_dists = []
+        it = tqdm(range(len(self.preds)), desc=desc, disable=not enable_progress_bar)
+        for i in it:
+            p = self.preds[i]
+            if p is None:
+                rms_dists.append(None)
+                continue
+            is_valid = p.valid and self.gts[i].valid
+            rms_dists.append(self.process_one(p, self.gts[i], is_valid))
+        rms_dists = np.array(rms_dists, dtype=object)
+        n_total = len(self.preds)
+        matched = rms_dists[rms_dists != None]  # noqa: E711 (None sentinel)
+        n_matched = len(matched)
+        mean_rms = float(matched.astype(float).mean()) if n_matched > 0 else float("nan")
+        return {
+            "match_rate": n_matched / n_total,
+            "rms_dist": mean_rms,
+            "n_matched": int(n_matched),
+            "n_total": int(n_total),
+        }
+
+
+def _one_to_one_metrics(
+    gen_structs: Sequence[Optional[Structure]],
+    ref_records: Sequence,
+    *,
+    ltol: float = 0.3,
+    stol: float = 0.5,
+    angle_tol: float = 10.0,
+) -> dict:
+    """One-to-one match rate + RMSE, unfiltered and filtered.
+
+    ``gen_structs[i]`` (Structure or None) is the single candidate for
+    ``ref_records[i]``. Returns ``unfiltered`` and ``filtered`` sub-dicts.
+    """
+    # References are ground truth: always valid.
+    gt_crys = [
+        MatchCrystal(
+            Structure(Lattice(r["lattice"].numpy()), r["atomic_numbers"].numpy(),
+                      r["frac_coords"].numpy(), coords_are_cartesian=False),
+            r["atomic_numbers"].numpy(),
+            compute_validity=False,
+        )
+        for r in ref_records
+    ]
+
+    # Generations: build once per mode (None -> None, an automatic miss).
+    def _build(compute_validity: bool):
+        out = []
+        for s in gen_structs:
+            if s is None:
+                out.append(None)
+            else:
+                out.append(MatchCrystal(s, s.atomic_numbers,
+                                        compute_validity=compute_validity))
+        return out
+
+    print("[1to1] computing one-to-one match rate (unfiltered + filtered) ...")
+    unfiltered = RecEval(
+        _build(compute_validity=False), gt_crys,
+        stol=stol, angle_tol=angle_tol, ltol=ltol,
+    ).get_match_rate_and_rms(desc="unfiltered")
+    filtered = RecEval(
+        _build(compute_validity=True), gt_crys,
+        stol=stol, angle_tol=angle_tol, ltol=ltol,
+    ).get_match_rate_and_rms(desc="filtered")
+    return {"unfiltered": unfiltered, "filtered": filtered}
 
 
 def main():
@@ -318,13 +537,11 @@ def main():
     print("[ref] building reference pymatgen structures ...")
     ref_list = [_ref_from_record(r) for r in tqdm(ref_records, desc="ref")]
 
-    # Load CIFs at fixed index order. METRe matching is composition-based,
-    # not index-based -- a missing or unparseable gen at index i simply
-    # reduces the pool of candidates for refs of that composition. Other
-    # refs of the same composition can still match against the remaining
-    # gens. So we don't abort here; we collect skips and report.
+    # Parse each CIF once, kept at its index (None if missing/unparseable);
+    # consumed by both METRe and the index-aligned match rate. We don't abort
+    # on per-CIF failures -- collect and report.
     print(f"[gen] loading CIFs from {samples_dir} ...")
-    gen_list: list[CrystalRecord] = []
+    gen_structs: list[Optional[Structure]] = [None] * n  # index-aligned
     missing: list[int] = []           # file doesn't exist
     unparseable: list[tuple[int, str]] = []  # (idx, short reason)
     for i in range(n):
@@ -333,7 +550,7 @@ def main():
             missing.append(i)
             continue
         try:
-            gen_list.append(_gen_from_cif(path))
+            gen_structs[i] = _struct_from_cif(path)
         except Exception as e:
             unparseable.append((i, type(e).__name__ + ": " + str(e)[:120]))
     n_dropped = len(missing) + len(unparseable)
@@ -344,14 +561,20 @@ def main():
               f"(first few: {[idx for idx, _ in unparseable[:5]]})")
         for idx, reason in unparseable[:5]:
             print(f"[gen]   {idx:05d}.cif: {reason}")
-    print(f"[gen] loaded gen_list: {len(gen_list)}/{n} "
+    n_loaded = n - n_dropped
+    print(f"[gen] loaded gens: {n_loaded}/{n} "
           f"({n_dropped} dropped, {100*n_dropped/n:.2f}%)")
 
-    if len(gen_list) == 0:
+    if n_loaded == 0:
         sys.stderr.write(
             f"[eval] all {n} CIFs missing or unparseable -- nothing to score.\n"
         )
         raise SystemExit(2)
+
+    # METRe pool: composition-bucketed CrystalRecords for the loaded gens.
+    gen_list = [
+        CrystalRecord(s, s.atomic_numbers) for s in gen_structs if s is not None
+    ]
 
     # Compute METRe at the fixed tolerances.
     print(f"[metre] computing METRe (stol=0.5, ltol=0.3, angle_tol=10.0, "
@@ -367,13 +590,28 @@ def main():
         enable_progress_bar=True,
         desc="metre",
     )
+
+    # One-to-one match rate (unfiltered + validity-filtered, paper Table 1).
+    one2one = _one_to_one_metrics(gen_structs, ref_records)
+
+    # --- report ---------------------------------------------------------
     print("=" * 60)
-    print(f"MaskGXT  METRe match rate (n={n}, higher is better) = "
-          f"{m['match_rate']*100:.2f}%   ({m['n_matched']}/{m['n_total']})")
-    print(f"         mean RMSD over matched only                = {m['mean_rmsd']:.4f}")
-    print(f"         cRMSE (lower is better, in [0, stol=0.5])  = {m['cRMSE']:.4f}")
+    print(f"MaskGXT evaluation  (n={n}, file={ref_file})")
+    print("-" * 60)
+    print("METRe (composition-pooled coverage):")
+    print(f"  match rate (higher is better) = {m['match_rate']*100:.2f}%   "
+          f"({m['n_matched']}/{m['n_total']})")
+    print(f"  mean RMSD over matched only   = {m['mean_rmsd']:.4f}")
+    print(f"  cRMSE (lower is better)       = {m['cRMSE']:.4f}")
+    print("-" * 60)
+    print("One-to-one CSP match rate (index-aligned, paper Table 1):")
+    uf, fl = one2one["unfiltered"], one2one["filtered"]
+    print(f"  Unfiltered  match rate = {uf['match_rate']*100:6.2f}%   "
+          f"RMSE = {uf['rms_dist']:.4f}   ({uf['n_matched']}/{uf['n_total']})")
+    print(f"  Filtered    match rate = {fl['match_rate']*100:6.2f}%   "
+          f"RMSE = {fl['rms_dist']:.4f}   ({fl['n_matched']}/{fl['n_total']})")
     print("=" * 60)
-    return m
+    return {**m, "one_to_one": one2one}
 
 
 if __name__ == "__main__":
