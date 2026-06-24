@@ -43,11 +43,11 @@ python prepare.py --dataset mp_20
 # 2. train (checkpoint -> runs/<run_name>/best.pt; use --batch_size 128 for mpts_52)
 python train.py --dataset mp_20 --run_name mp20
 
-# 3. sample one CIF per test entry
-python sample.py --dataset mp_20 --greedy --ckpt runs/mp20/best.pt   # match rate
-python sample.py --dataset mp_20 --greedy --sg_stratify --ckpt runs/mp20/best.pt  # METRe
+# 3. sample one CIF per test entry (each command writes a separate samples dir)
+python sample.py --dataset mp_20 --greedy --ckpt runs/mp20/best.pt                 # Table 1 (one-to-one)
+python sample.py --dataset mp_20 --greedy --sg_stratify --ckpt runs/mp20/best.pt   # Table 2 (METRe)
 
-# 4. score (prints both metric families, see below)
+# 4. score (each run prints all metrics; read the column matching the samples)
 python evaluate.py --samples_dir runs/mp20/<decode tag>_samples --dataset mp_20
 ```
 
