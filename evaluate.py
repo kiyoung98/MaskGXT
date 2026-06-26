@@ -20,7 +20,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import partial, reduce
 from math import gcd
@@ -446,6 +445,7 @@ def _one_to_one_metrics(
     ltol: float = 0.3,
     stol: float = 0.5,
     angle_tol: float = 10.0,
+    enable_progress_bar: bool = True,
 ) -> dict:
     """One-to-one match rate + RMSE, unfiltered and filtered.
 
@@ -478,12 +478,125 @@ def _one_to_one_metrics(
     unfiltered = RecEval(
         _build(compute_validity=False), gt_crys,
         stol=stol, angle_tol=angle_tol, ltol=ltol,
-    ).get_match_rate_and_rms(desc="unfiltered")
+    ).get_match_rate_and_rms(enable_progress_bar=enable_progress_bar, desc="unfiltered")
     filtered = RecEval(
         _build(compute_validity=True), gt_crys,
         stol=stol, angle_tol=angle_tol, ltol=ltol,
-    ).get_match_rate_and_rms(desc="filtered")
+    ).get_match_rate_and_rms(enable_progress_bar=enable_progress_bar, desc="filtered")
     return {"unfiltered": unfiltered, "filtered": filtered}
+
+
+def compute_metrics(samples_dir, ref_file, *, data_dir="./data", limit=0,
+                    num_workers=0, enable_progress_bar=True) -> dict:
+    """Load CIF samples + reference split and compute every metric in one pass.
+
+    Single source of truth for the numbers: ``main`` prints what this returns,
+    and ``train.py`` calls it directly (no subprocess, no stdout parsing). A
+    failed measurement raises here rather than degrading to a silent sentinel.
+
+    Returns the METRe keys (``match_rate``, ``cRMSE``, ``mean_rmsd``,
+    ``n_matched``, ``n_total``) plus ``one_to_one`` (unfiltered/filtered) and
+    ``ref_file``. Raises FileNotFoundError (missing samples_dir / reference) or
+    ValueError (no CIF could be loaded).
+    """
+    samples_dir = Path(samples_dir)
+    if not samples_dir.is_dir():
+        raise FileNotFoundError(f"samples_dir not found: {samples_dir}")
+
+    # Load reference split (ground truth used only as reference for matching).
+    ref_path = Path(data_dir) / ref_file
+    if not ref_path.is_file():
+        raise FileNotFoundError(f"reference file not found: {ref_path}")
+    ref_records = torch.load(str(ref_path), weights_only=False)
+    if limit > 0:
+        ref_records = ref_records[:limit]
+    n = len(ref_records)
+    print(f"[data] reference split: {n} structures (file={ref_file})")
+
+    print("[ref] building reference pymatgen structures ...")
+    ref_list = [_ref_from_record(r)
+                for r in tqdm(ref_records, desc="ref", disable=not enable_progress_bar)]
+
+    # Parse each CIF once, kept at its index (None if missing/unparseable);
+    # consumed by both METRe and the index-aligned match rate. We don't abort
+    # on per-CIF failures -- collect and report.
+    print(f"[gen] loading CIFs from {samples_dir} ...")
+    gen_structs: list[Optional[Structure]] = [None] * n  # index-aligned
+    missing: list[int] = []           # file doesn't exist
+    unparseable: list[tuple[int, str]] = []  # (idx, short reason)
+    for i in range(n):
+        path = samples_dir / f"{i:05d}.cif"
+        if not path.exists():
+            missing.append(i)
+            continue
+        try:
+            gen_structs[i] = _struct_from_cif(path)
+        except Exception as e:
+            unparseable.append((i, type(e).__name__ + ": " + str(e)[:120]))
+    n_dropped = len(missing) + len(unparseable)
+    if missing:
+        print(f"[gen] missing {len(missing)} CIFs (first few: {missing[:5]})")
+    if unparseable:
+        print(f"[gen] unparseable {len(unparseable)} CIFs "
+              f"(first few: {[idx for idx, _ in unparseable[:5]]})")
+        for idx, reason in unparseable[:5]:
+            print(f"[gen]   {idx:05d}.cif: {reason}")
+    n_loaded = n - n_dropped
+    print(f"[gen] loaded gens: {n_loaded}/{n} "
+          f"({n_dropped} dropped, {100*n_dropped/n:.2f}%)")
+
+    if n_loaded == 0:
+        raise ValueError(
+            f"all {n} CIFs in {samples_dir} missing or unparseable -- nothing to score."
+        )
+
+    # METRe pool: composition-bucketed CrystalRecords for the loaded gens.
+    gen_list = [
+        CrystalRecord(s, s.atomic_numbers) for s in gen_structs if s is not None
+    ]
+
+    # Compute METRe at the fixed tolerances.
+    print(f"[metre] computing METRe (stol=0.5, ltol=0.3, angle_tol=10.0, "
+          f"workers={num_workers or 'seq'}) ...")
+    m = metre_metrics(
+        gen_list,
+        ref_list,
+        ltol=0.3,
+        stol=0.5,
+        angle_tol=10.0,
+        num_workers=num_workers if num_workers > 0 else None,
+        check_reduced=True,
+        enable_progress_bar=enable_progress_bar,
+        desc="metre",
+    )
+
+    # One-to-one match rate (unfiltered + validity-filtered, paper Table 1).
+    one2one = _one_to_one_metrics(gen_structs, ref_records,
+                                  enable_progress_bar=enable_progress_bar)
+
+    return {**m, "one_to_one": one2one, "ref_file": ref_file}
+
+
+def _print_report(result: dict) -> None:
+    """Print the human-readable metric block for ``compute_metrics`` output."""
+    m = result
+    one2one = result["one_to_one"]
+    print("=" * 60)
+    print(f"MaskGXT evaluation  (n={m['n_total']}, file={result['ref_file']})")
+    print("-" * 60)
+    print("METRe (composition-pooled coverage):")
+    print(f"  match rate (higher is better) = {m['match_rate']*100:.2f}%   "
+          f"({m['n_matched']}/{m['n_total']})")
+    print(f"  mean RMSD over matched only   = {m['mean_rmsd']:.4f}")
+    print(f"  cRMSE (lower is better)       = {m['cRMSE']:.4f}")
+    print("-" * 60)
+    print("One-to-one CSP match rate (index-aligned, paper Table 1):")
+    uf, fl = one2one["unfiltered"], one2one["filtered"]
+    print(f"  Unfiltered  match rate = {uf['match_rate']*100:6.2f}%   "
+          f"RMSE = {uf['rms_dist']:.4f}   ({uf['n_matched']}/{uf['n_total']})")
+    print(f"  Filtered    match rate = {fl['match_rate']*100:6.2f}%   "
+          f"RMSE = {fl['rms_dist']:.4f}   ({fl['n_matched']}/{fl['n_total']})")
+    print("=" * 60)
 
 
 def main():
@@ -520,98 +633,15 @@ def main():
     else:
         raise SystemExit("provide --dataset (and optional --split) or --test_file")
 
-    samples_dir = Path(args.samples_dir)
-    if not samples_dir.is_dir():
-        raise SystemExit(f"samples_dir not found: {samples_dir}")
-
-    # Load reference split (ground truth used only as reference for matching).
-    ref_path = Path(args.data_dir) / ref_file
-    if not ref_path.is_file():
-        raise SystemExit(f"reference file not found: {ref_path}")
-    ref_records = torch.load(str(ref_path), weights_only=False)
-    if args.limit > 0:
-        ref_records = ref_records[:args.limit]
-    n = len(ref_records)
-    print(f"[data] reference split: {n} structures (file={ref_file})")
-
-    print("[ref] building reference pymatgen structures ...")
-    ref_list = [_ref_from_record(r) for r in tqdm(ref_records, desc="ref")]
-
-    # Parse each CIF once, kept at its index (None if missing/unparseable);
-    # consumed by both METRe and the index-aligned match rate. We don't abort
-    # on per-CIF failures -- collect and report.
-    print(f"[gen] loading CIFs from {samples_dir} ...")
-    gen_structs: list[Optional[Structure]] = [None] * n  # index-aligned
-    missing: list[int] = []           # file doesn't exist
-    unparseable: list[tuple[int, str]] = []  # (idx, short reason)
-    for i in range(n):
-        path = samples_dir / f"{i:05d}.cif"
-        if not path.exists():
-            missing.append(i)
-            continue
-        try:
-            gen_structs[i] = _struct_from_cif(path)
-        except Exception as e:
-            unparseable.append((i, type(e).__name__ + ": " + str(e)[:120]))
-    n_dropped = len(missing) + len(unparseable)
-    if missing:
-        print(f"[gen] missing {len(missing)} CIFs (first few: {missing[:5]})")
-    if unparseable:
-        print(f"[gen] unparseable {len(unparseable)} CIFs "
-              f"(first few: {[idx for idx, _ in unparseable[:5]]})")
-        for idx, reason in unparseable[:5]:
-            print(f"[gen]   {idx:05d}.cif: {reason}")
-    n_loaded = n - n_dropped
-    print(f"[gen] loaded gens: {n_loaded}/{n} "
-          f"({n_dropped} dropped, {100*n_dropped/n:.2f}%)")
-
-    if n_loaded == 0:
-        sys.stderr.write(
-            f"[eval] all {n} CIFs missing or unparseable -- nothing to score.\n"
+    try:
+        result = compute_metrics(
+            args.samples_dir, ref_file,
+            data_dir=args.data_dir, limit=args.limit, num_workers=args.num_workers,
         )
-        raise SystemExit(2)
-
-    # METRe pool: composition-bucketed CrystalRecords for the loaded gens.
-    gen_list = [
-        CrystalRecord(s, s.atomic_numbers) for s in gen_structs if s is not None
-    ]
-
-    # Compute METRe at the fixed tolerances.
-    print(f"[metre] computing METRe (stol=0.5, ltol=0.3, angle_tol=10.0, "
-          f"workers={args.num_workers or 'seq'}) ...")
-    m = metre_metrics(
-        gen_list,
-        ref_list,
-        ltol=0.3,
-        stol=0.5,
-        angle_tol=10.0,
-        num_workers=args.num_workers if args.num_workers > 0 else None,
-        check_reduced=True,
-        enable_progress_bar=True,
-        desc="metre",
-    )
-
-    # One-to-one match rate (unfiltered + validity-filtered, paper Table 1).
-    one2one = _one_to_one_metrics(gen_structs, ref_records)
-
-    # --- report ---------------------------------------------------------
-    print("=" * 60)
-    print(f"MaskGXT evaluation  (n={n}, file={ref_file})")
-    print("-" * 60)
-    print("METRe (composition-pooled coverage):")
-    print(f"  match rate (higher is better) = {m['match_rate']*100:.2f}%   "
-          f"({m['n_matched']}/{m['n_total']})")
-    print(f"  mean RMSD over matched only   = {m['mean_rmsd']:.4f}")
-    print(f"  cRMSE (lower is better)       = {m['cRMSE']:.4f}")
-    print("-" * 60)
-    print("One-to-one CSP match rate (index-aligned, paper Table 1):")
-    uf, fl = one2one["unfiltered"], one2one["filtered"]
-    print(f"  Unfiltered  match rate = {uf['match_rate']*100:6.2f}%   "
-          f"RMSE = {uf['rms_dist']:.4f}   ({uf['n_matched']}/{uf['n_total']})")
-    print(f"  Filtered    match rate = {fl['match_rate']*100:6.2f}%   "
-          f"RMSE = {fl['rms_dist']:.4f}   ({fl['n_matched']}/{fl['n_total']})")
-    print("=" * 60)
-    return {**m, "one_to_one": one2one}
+    except (FileNotFoundError, ValueError) as e:
+        raise SystemExit(str(e))
+    _print_report(result)
+    return result
 
 
 if __name__ == "__main__":

@@ -24,7 +24,6 @@ import math
 import os
 import sys
 import time
-import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -1388,48 +1387,21 @@ def generate_cifs(model, records, out_dir, device, cur_steps, rng):
 
 
 def run_metre(samples_dir, ref_file, script_dir) -> float:
-    """Run evaluate.py as a subprocess and parse the METRe match rate in [0,1].
+    """Compute the METRe match rate in [0, 1] for a directory of CIF samples.
 
-    Returns float('nan') on any failure/timeout.
+    Calls ``evaluate.compute_metrics`` in-process and reads the value directly,
+    so the metric never depends on the layout of evaluate.py's printed report.
+    A failed measurement propagates as an exception (loud) rather than being
+    swallowed into a sentinel the caller would mistake for "no improvement".
     """
-    samples_dir = Path(samples_dir)
-    script_dir = Path(script_dir)
-    metre = float("nan")
-    try:
-        proc = subprocess.run(
-            [sys.executable, str(script_dir / "evaluate.py"),
-             "--samples_dir", str(samples_dir),
-             "--data_dir", str(script_dir / "data"),
-             "--test_file", str(ref_file),
-             "--num_workers", "0"],
-            cwd=str(script_dir),
-            capture_output=True, text=True, timeout=3600,
-        )
-        print(proc.stdout, flush=True)
-        if proc.returncode != 0:
-            print(f"[eval] STDERR:\n{proc.stderr}", flush=True)
-        for line in proc.stdout.splitlines():
-            # evaluate.py prints the METRe coverage metric as a two-line block:
-            #   "METRe (composition-pooled coverage):"
-            #   "  match rate (higher is better) = XX.XX%   (n/m)"
-            # so match the value line by its unique phrase. (The pre-1814bcd
-            # one-line "METRe match rate = XX%" format is still accepted.) The
-            # one-to-one rows say "Unfiltered/Filtered match rate" and are
-            # deliberately excluded so we never pick the Table-1 number here.
-            if (("match rate (higher is better)" in line
-                 or "METRe match rate" in line) and "%" in line):
-                try:
-                    pct_part = line.split("=")[-1].strip()
-                    pct = float(pct_part.split("%")[0].strip())
-                    metre = pct / 100.0
-                    break
-                except Exception:
-                    pass
-    except subprocess.TimeoutExpired:
-        print("[eval] TIMEOUT", flush=True)
-    except Exception as e:
-        print(f"[eval] error: {e}", flush=True)
-    return metre
+    from evaluate import compute_metrics
+
+    result = compute_metrics(
+        samples_dir, str(ref_file),
+        data_dir=str(Path(script_dir) / "data"),
+        num_workers=0,
+    )
+    return result["match_rate"]
 
 
 # ----------------------------- main --------------------------------------- #
