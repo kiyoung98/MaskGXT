@@ -1409,7 +1409,15 @@ def run_metre(samples_dir, ref_file, script_dir) -> float:
         if proc.returncode != 0:
             print(f"[eval] STDERR:\n{proc.stderr}", flush=True)
         for line in proc.stdout.splitlines():
-            if "METRe match rate" in line and "%" in line:
+            # evaluate.py prints the METRe coverage metric as a two-line block:
+            #   "METRe (composition-pooled coverage):"
+            #   "  match rate (higher is better) = XX.XX%   (n/m)"
+            # so match the value line by its unique phrase. (The pre-1814bcd
+            # one-line "METRe match rate = XX%" format is still accepted.) The
+            # one-to-one rows say "Unfiltered/Filtered match rate" and are
+            # deliberately excluded so we never pick the Table-1 number here.
+            if (("match rate (higher is better)" in line
+                 or "METRe match rate" in line) and "%" in line):
                 try:
                     pct_part = line.split("=")[-1].strip()
                     pct = float(pct_part.split("%")[0].strip())
