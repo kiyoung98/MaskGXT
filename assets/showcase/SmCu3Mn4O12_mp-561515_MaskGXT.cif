@@ -1,0 +1,40 @@
+data_gen
+_symmetry_space_group_name_H-M   'P 1'
+_cell_length_a    6.443665
+_cell_length_b    6.439316
+_cell_length_c    6.441055
+_cell_angle_alpha 109.480591
+_cell_angle_beta  109.476929
+_cell_angle_gamma 109.480591
+_symmetry_Int_Tables_number 1
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  Sm  Sm1  0.000031  0.000000  0.000000  1.0
+  Mn  Mn1  0.500031  0.000031  0.000000  1.0
+  Mn  Mn2  0.000031  0.000000  0.500031  1.0
+  Mn  Mn3  0.000031  0.500000  0.000000  1.0
+  Mn  Mn4  0.500031  0.500031  0.500031  1.0
+  Cu  Cu1  0.500031  0.500000  0.000000  1.0
+  Cu  Cu2  0.500000  0.000000  0.500000  1.0
+  Cu  Cu3  0.000000  0.500000  0.500000  1.0
+  O  O1  0.304409  0.168121  0.472794  1.0
+  O  O2  0.694916  0.833084  0.527023  1.0
+  O  O3  0.304866  0.831726  0.133198  1.0
+  O  O4  0.694889  0.168304  0.864029  1.0
+  O  O5  0.832062  0.526566  0.694897  1.0
+  O  O6  0.168304  0.473633  0.305054  1.0
+  O  O7  0.169586  0.865471  0.695766  1.0
+  O  O8  0.830811  0.136292  0.306282  1.0
+  O  O9  0.133522  0.306557  0.831482  1.0
+  O  O10  0.864822  0.694542  0.168060  1.0
+  O  O11  0.474579  0.305401  0.168488  1.0
+  O  O12  0.526093  0.695386  0.832214  1.0
