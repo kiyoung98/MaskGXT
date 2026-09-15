@@ -1418,6 +1418,10 @@ def main():
     parser.add_argument("--early_stop_patience", type=int, default=6)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--run_name", type=str, required=True)
+    parser.add_argument("--seed", type=int, default=None,
+                        help="training seed (model init, data order, augmentation "
+                             "via the loader workers); default leaves RNGs unseeded. "
+                             "Validation/test sampling keep their fixed seed 0.")
     args = parser.parse_args()
 
     # MAX_N was already resolved at import from --dataset (see _peek_dataset);
@@ -1426,6 +1430,12 @@ def main():
         f"dataset mismatch: import-time {DATASET!r} vs parsed {args.dataset!r}"
     )
     BATCH_SIZE = args.batch_size
+    if args.seed is not None:
+        # before the model and DataLoader exist: covers init, shuffling and the
+        # workers' base seeds (hence the dataset's torch.rand augmentations)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+    print(f"[init] seed={args.seed}", flush=True)
 
     t_total_start = time.time()
 
