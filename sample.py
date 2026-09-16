@@ -98,8 +98,9 @@ jitter_coincident_sites = T.jitter_coincident_sites
 # Posterior mass floor: an SG must hold at least this much first-step mass to
 # be eligible as a clamp target for a non-anchor chain. Below this we treat it
 # as unsupported and fall back to i.i.d. (guards precision against OOD clamps).
-# (KEPT, 783920c core — the near-optimal ~2039-row SG-clamp reach.)
-SG_POST_FLOOR = 0.02
+# CONSOLIDATED: 0.0 -- the floor only traded METRe away (0.02 left ~15% of the
+# records unclamped, and they collapse onto the dominant SG).
+SG_POST_FLOOR = 0.0
 
 # Sentinel effective-SG id for FREE (sg_clamp<0) chains: all free chains in a
 # composition group share one bucket (they will i.i.d.-sample SG and tend to
@@ -624,8 +625,8 @@ def generate_cifs(model, records, out_dir, device, cur_steps, rng,
                     params = np.array([5.0, 5.0, 5.0, 90.0, 90.0, 90.0])
 
                 frac = dequantize_frac(coord_best_np[bi, :N_size], offset=coord_off_np[bi, :N_size])
-                # clash repair stays on the INDEPENDENT shared rng (safety valve)
-                frac = jitter_coincident_sites(frac, L, rng, min_dist=0.4)
+                # CONSOLIDATED: decode-time clash jitter removed (never fires on
+                # physical structures: bin width ~0.1 A vs 0.4 A trigger)
                 frac = frac % 1.0
 
                 z_orig = records[vi]["atomic_numbers"].long()

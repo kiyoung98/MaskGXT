@@ -115,7 +115,7 @@ SHIFT_AUG_P = 0.7  # full shift aug
 # +-1 bin -> at most label-smoothing of the ordinal target). Applied with
 # prob COORD_NOISE_P per crystal so half the batch still sees the exact
 # quantized centers. Coords are wrapped mod 1 after the jitter (periodic).
-COORD_NOISE_P = 0.5
+COORD_NOISE_P = 0.0  # CONSOLIDATED: coord-noise aug removed (no measurable gain)
 COORD_NOISE_SIGMA_BIN = 0.30
 # Precomputed table precompute/normalizer.pt provides, per space group,
 # the finite list of Euclidean-normalizer translation cosets:
@@ -1332,7 +1332,8 @@ def generate_cifs(model, records, out_dir, device, cur_steps, rng):
                     params = np.array([5.0, 5.0, 5.0, 90.0, 90.0, 90.0])
 
                 frac = dequantize_frac(coord_best_np[bi, :N_size], offset=coord_off_np[bi, :N_size])
-                frac = jitter_coincident_sites(frac, L, rng, min_dist=0.4)
+                # CONSOLIDATED: decode-time clash jitter removed (never fires on
+                # physical structures: bin width ~0.1 A vs 0.4 A trigger)
                 frac = frac % 1.0
 
                 z_orig = records[vi]["atomic_numbers"].long()
