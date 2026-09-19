@@ -684,6 +684,22 @@ def generate_cifs(model, records, out_dir, device, cur_steps, rng,
 
 
 # --- composition-group helpers (reduced-formula bucketing) ---
+# Which rows share one SG-stratification bucket. "reduced" (default) matches
+# metre's own composition key, so a bucket holds every generation metre will
+# pool: this is how the main table is sampled. "exact" buckets by the formula
+# as written, so Si2O4 and Si4O8 coordinate separately and each gets its own
+# top-S space groups -- what the uniform per-composition budget asks for, where
+# S is defined on the formula as written. Scoring is unaffected either way:
+# evaluate.py always pools by the reduced key.
+_GROUP_KEY = os.environ.get("MASKGXT_GROUP_KEY", "reduced")
+assert _GROUP_KEY in ("reduced", "exact"), f"bad MASKGXT_GROUP_KEY={_GROUP_KEY!r}"
+
+
+def _exact_formula_key(atomic_numbers: np.ndarray) -> tuple:
+    """Composition key without GCD reduction: Si2O4 and Si4O8 differ."""
+    return tuple(int(x) for x in np.sort(atomic_numbers.astype(np.int64)))
+
+
 def _reduced_formula_key(atomic_numbers: np.ndarray) -> tuple:
     """Reduced-formula composition key matching metre `_composition_key`."""
     counts = np.bincount(atomic_numbers.astype(np.int64), minlength=119).astype(np.int64)
@@ -697,11 +713,12 @@ def _reduced_formula_key(atomic_numbers: np.ndarray) -> tuple:
 
 
 def compute_group_ids(records) -> list[int]:
-    """Map each record index -> integer composition-group id (reduced formula)."""
+    """Map each record index -> integer composition-group id (see _GROUP_KEY)."""
+    key_fn = (_exact_formula_key if _GROUP_KEY == "exact" else _reduced_formula_key)
     key_to_gid: dict[tuple, int] = {}
     gids: list[int] = []
     for r in records:
-        k = _reduced_formula_key(r["atomic_numbers"].numpy())
+        k = key_fn(r["atomic_numbers"].numpy())
         if k not in key_to_gid:
             key_to_gid[k] = len(key_to_gid)
         gids.append(key_to_gid[k])
