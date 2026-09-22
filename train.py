@@ -107,16 +107,6 @@ EN_TABLE_CPU = _torch_en.tensor(PAULING_EN, dtype=_torch_en.float32)
 # augmentation entirely.
 SHIFT_AUG_P = 0.7  # full shift aug
 
-# === sub-bin coord-noise aug ===
-# Per-coordinate Gaussian jitter added in fractional units BEFORE
-# quantize_frac. Standard deviation is COORD_NOISE_SIGMA_BIN bin-widths
-# (1 bin = 1/K_BINS in frac units). 0.30 bin-widths -> sigma ~= 0.0047 in
-# frac coords, so the perturbation is well sub-bin (>99% of mass within
-# +-1 bin -> at most label-smoothing of the ordinal target). Applied with
-# prob COORD_NOISE_P per crystal so half the batch still sees the exact
-# quantized centers. Coords are wrapped mod 1 after the jitter (periodic).
-COORD_NOISE_P = 0.5
-COORD_NOISE_SIGMA_BIN = 0.30
 # Precomputed table precompute/normalizer.pt provides, per space group,
 # the finite list of Euclidean-normalizer translation cosets:
 #   normalizer[sg]["translations"] : list[np.float32 [3]] coset reps
@@ -489,8 +479,7 @@ def wyk_to_embed_id(raw_tok: int) -> int:
 class CrystalDataset(Dataset):
     def __init__(self, path: str, wyckoff_cache: list, wyk_index: dict,
                  normalizer: dict | None = None,
-                 shift_aug_p: float = 0.0, orbit_perm_p: float = 0.0,
-                 coord_noise_p: float = 0.0, coord_noise_sigma_bin: float = 0.0):
+                 shift_aug_p: float = 0.0, orbit_perm_p: float = 0.0):
         self.records = torch.load(path, weights_only=False)
         self.wyk = wyckoff_cache
         assert len(self.wyk) == len(self.records), (
@@ -543,9 +532,6 @@ class CrystalDataset(Dataset):
         # === atom-permutation-symmetry break ===
         self.orbit_perm_p = orbit_perm_p
         self.en_table = EN_TABLE_CPU
-        # === sub-bin coord-noise aug ===
-        self.coord_noise_p = coord_noise_p
-        self.coord_noise_sigma = float(coord_noise_sigma_bin) / float(K_BINS)
 
     def __len__(self):
         return len(self.records)
@@ -621,15 +607,6 @@ class CrystalDataset(Dataset):
             for i in range(min(N, len(raw_w))):
                 wyk_ids[i] = wyk_to_embed_id(int(raw_w[i]))
 
-        # === sub-bin Gaussian coord-noise aug ===
-        # Independent per-coordinate Gaussian jitter in fractional units,
-        # applied AFTER the (already-shifted) frac coords, BEFORE quantize.
-        # Periodic wrap (mod 1) preserves the exact crystal symmetry that
-        # the data prior assumes. Only fires for prob coord_noise_p.
-        if self.coord_noise_p > 0.0 and self.coord_noise_sigma > 0.0 \
-                and torch.rand(()).item() < self.coord_noise_p:
-            noise = torch.randn_like(frac) * self.coord_noise_sigma
-            frac = (frac + noise) % 1.0
         coord_tok = quantize_frac(frac)
         # exp#1: sub-bin offset target (bin-width units), aligned with coord_tok
         # BEFORE the permutations below; permuted alongside coord_tok.
@@ -1217,24 +1194,6 @@ def write_cif(path: Path, params: np.ndarray, frac_coords: np.ndarray, atomic_nu
     path.write_text("\n".join(lines) + "\n")
 
 
-def jitter_coincident_sites(frac: np.ndarray, lat: np.ndarray, rng: np.random.Generator, min_dist=0.4):
-    if frac.shape[0] < 2:
-        return frac
-    for _ in range(3):
-        cart = frac @ lat
-        ok = True
-        for i in range(len(cart)):
-            for j in range(i + 1, len(cart)):
-                d = cart[i] - cart[j]
-                if np.linalg.norm(d) < min_dist:
-                    frac[j] = (frac[j] + (rng.random(3) - 0.5) * 0.1) % 1.0
-                    ok = False
-        if ok:
-            break
-    return frac
-
-
-# ----------------------------- weight EMA --------------------------------- #
 def update_ema(ema_state: dict, model: nn.Module, decay: float):
     """In-place EMA update of `ema_state` toward the live `model` weights.
 
@@ -1332,7 +1291,8 @@ def generate_cifs(model, records, out_dir, device, cur_steps, rng):
                     params = np.array([5.0, 5.0, 5.0, 90.0, 90.0, 90.0])
 
                 frac = dequantize_frac(coord_best_np[bi, :N_size], offset=coord_off_np[bi, :N_size])
-                frac = jitter_coincident_sites(frac, L, rng, min_dist=0.4)
+                # CONSOLIDATED: decode-time clash jitter removed (never fires on
+                # physical structures: bin width ~0.1 A vs 0.4 A trigger)
                 frac = frac % 1.0
 
                 z_orig = records[vi]["atomic_numbers"].long()
@@ -1418,6 +1378,10 @@ def main():
     parser.add_argument("--early_stop_patience", type=int, default=6)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
     parser.add_argument("--run_name", type=str, required=True)
+    parser.add_argument("--seed", type=int, default=None,
+                        help="training seed (model init, data order, augmentation "
+                             "via the loader workers); default leaves RNGs unseeded. "
+                             "Validation/test sampling keep their fixed seed 0.")
     args = parser.parse_args()
 
     # MAX_N was already resolved at import from --dataset (see _peek_dataset);
@@ -1426,6 +1390,12 @@ def main():
         f"dataset mismatch: import-time {DATASET!r} vs parsed {args.dataset!r}"
     )
     BATCH_SIZE = args.batch_size
+    if args.seed is not None:
+        # before the model and DataLoader exist: covers init, shuffling and the
+        # workers' base seeds (hence the dataset's torch.rand augmentations)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+    print(f"[init] seed={args.seed}", flush=True)
 
     t_total_start = time.time()
 
@@ -1457,16 +1427,10 @@ def main():
         str(train_path), wyk_cache, wyk_index,
         normalizer=normalizer,
         shift_aug_p=SHIFT_AUG_P, orbit_perm_p=ORBIT_PERM_P,
-        coord_noise_p=COORD_NOISE_P,
-        coord_noise_sigma_bin=COORD_NOISE_SIGMA_BIN,
     )
     print(f"[permsym] per-atom pos_embed ON; canonical EN sort + "
           f"intra/inter-orbit perm aug (p={ORBIT_PERM_P}); sample order = "
           f"stable_argsort(EN[Z])", flush=True)
-    print(f"[coordnoise] sub-bin Gaussian coord-noise aug: "
-          f"sigma={COORD_NOISE_SIGMA_BIN:.3f} bins "
-          f"(={COORD_NOISE_SIGMA_BIN/K_BINS:.5f} frac), p={COORD_NOISE_P}, "
-          f"applied AFTER shift+orbit-perm, BEFORE quantize", flush=True)
     if not normalizer.get("enabled"):
         print("[aug] running WITHOUT online normalizer augmentation (fallback).", flush=True)
     else:

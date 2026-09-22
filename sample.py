@@ -26,7 +26,7 @@ The model, tokenization, and dequantization are imported from ``train.py`` (one
 source of truth, so the sampler always matches the trained checkpoint). The
 SG-stratification / anchor-greedy decode logic lives in this file because it is
 sampling-only logic absent from training. Decode config (canonical minimal
-core): ``SG_POST_FLOOR=0.02``, lattice repulsion off, non-greedy temperature 1.0.
+core): lattice repulsion off, non-greedy temperature 1.0.
 
 Usage:
     # single-best match rate (i.i.d. SG, all-argmax)
@@ -86,7 +86,6 @@ dequantize_frac = T.dequantize_frac
 dequantize_lat_params = T.dequantize_lat_params
 params_to_lattice_matrix = T.params_to_lattice_matrix
 write_cif = T.write_cif
-jitter_coincident_sites = T.jitter_coincident_sites
 
 
 # ============================================================================
@@ -95,11 +94,6 @@ jitter_coincident_sites = T.jitter_coincident_sites
 # The --greedy and --sg_stratify flags select which parts engage.
 # ============================================================================
 
-# Posterior mass floor: an SG must hold at least this much first-step mass to
-# be eligible as a clamp target for a non-anchor chain. Below this we treat it
-# as unsupported and fall back to i.i.d. (guards precision against OOD clamps).
-# (KEPT, 783920c core — the near-optimal ~2039-row SG-clamp reach.)
-SG_POST_FLOOR = 0.02
 
 # Sentinel effective-SG id for FREE (sg_clamp<0) chains: all free chains in a
 # composition group share one bucket (they will i.i.d.-sample SG and tend to
@@ -108,7 +102,7 @@ _FREE_SG = 0
 
 
 
-def assign_group_space_groups(group_ids, sg_post, sg_floor=SG_POST_FLOOR):
+def assign_group_space_groups(group_ids, sg_post):
     """Greedy SG-stratified WITHOUT-REPLACEMENT assignment per composition group.
 
     Args:
@@ -116,8 +110,6 @@ def assign_group_space_groups(group_ids, sg_post, sg_floor=SG_POST_FLOOR):
                  the same reduced-formula composition (one pooled bucket).
       sg_post:   (B, sg_vocab) float tensor on CPU -- each record's first-step
                  (t=1, fully-masked) SG posterior with SG_MASK already zeroed.
-      sg_floor:  minimum posterior mass for an SG to be a clamp target.
-
     Returns:
       sg_clamp: (B,) long tensor. sg_clamp[b] in [1, N_SG] => pin that SG for
                 record b; sg_clamp[b] == -1 => leave SG free (i.i.d. path).
@@ -128,8 +120,9 @@ def assign_group_space_groups(group_ids, sg_post, sg_floor=SG_POST_FLOOR):
         confident member is the ANCHOR (chain 0) and is pinned to its MAP SG
         (its argmax) -- the dominant mode is never lost. Each subsequent
         member is pinned to the highest-posterior SG (by ITS OWN posterior)
-        not yet used in the group AND with mass >= sg_floor; if none qualifies
-        the member falls back to free i.i.d. sampling (sg_clamp = -1).
+        not yet used in the group. Every group is far smaller than the 230
+        space groups, so a member always finds one; sg_clamp = -1 survives only
+        as the singleton path.
     """
     if not torch.is_tensor(group_ids):
         group_ids = torch.as_tensor(group_ids)
@@ -166,8 +159,6 @@ def assign_group_space_groups(group_ids, sg_post, sg_floor=SG_POST_FLOOR):
                     continue
                 if sg_id in used:
                     continue
-                if float(post_b[sg_id]) < sg_floor:
-                    break  # remaining are below floor (sorted) -> stop
                 chosen = sg_id
                 break
             if chosen >= 1:
@@ -462,9 +453,8 @@ def generate_cifs(model, records, out_dir, device, cur_steps, rng,
     """Sample one CIF per record into `out_dir/{idx:05d}.cif`, return n_written.
 
     Groups records by atom count N, OOM-halves comps_per_call, runs
-    sample_batch, dequantizes the lattice + fractional coords, jitters
-    coincident sites, writes a CIF per record, then fills any missing index
-    with a safe fallback CIF.
+    sample_batch, dequantizes the lattice + fractional coords, writes a CIF per
+    record, then fills any missing index with a safe fallback CIF.
 
     Two independent decode controls (see sample_batch):
       * ``greedy`` -- MAP/argmax token selection. Unstratified: every row;
@@ -624,8 +614,8 @@ def generate_cifs(model, records, out_dir, device, cur_steps, rng,
                     params = np.array([5.0, 5.0, 5.0, 90.0, 90.0, 90.0])
 
                 frac = dequantize_frac(coord_best_np[bi, :N_size], offset=coord_off_np[bi, :N_size])
-                # clash repair stays on the INDEPENDENT shared rng (safety valve)
-                frac = jitter_coincident_sites(frac, L, rng, min_dist=0.4)
+                # CONSOLIDATED: decode-time clash jitter removed (never fires on
+                # physical structures: bin width ~0.1 A vs 0.4 A trigger)
                 frac = frac % 1.0
 
                 z_orig = records[vi]["atomic_numbers"].long()
@@ -683,24 +673,26 @@ def generate_cifs(model, records, out_dir, device, cur_steps, rng,
 
 
 # --- composition-group helpers (reduced-formula bucketing) ---
-def _reduced_formula_key(atomic_numbers: np.ndarray) -> tuple:
-    """Reduced-formula composition key matching metre `_composition_key`."""
-    counts = np.bincount(atomic_numbers.astype(np.int64), minlength=119).astype(np.int64)
-    nz = counts[counts > 0]
-    if nz.size == 0:
-        return ()
-    g = int(_reduce(_gcd, (int(x) for x in nz)))
-    if g > 1:
-        counts = counts // g
-    return tuple(int(x) for x in counts)
+
+
+def _formula_key(atomic_numbers: np.ndarray) -> tuple:
+    """Composition key: the formula as written, so Si2O4 and Si4O8 differ.
+
+    This is what the model is conditioned on, so it is also the right unit for
+    coordinating space groups: each formula gets its own top-k, instead of
+    competing with the other cell sizes of its reduced formula for one pool.
+    Scoring is a separate question -- metre pools references by the REDUCED
+    formula (see evaluate.py), and that is left untouched.
+    """
+    return tuple(int(x) for x in np.sort(atomic_numbers.astype(np.int64)))
 
 
 def compute_group_ids(records) -> list[int]:
-    """Map each record index -> integer composition-group id (reduced formula)."""
+    """Map each record index -> integer composition-group id."""
     key_to_gid: dict[tuple, int] = {}
     gids: list[int] = []
     for r in records:
-        k = _reduced_formula_key(r["atomic_numbers"].numpy())
+        k = _formula_key(r["atomic_numbers"].numpy())
         if k not in key_to_gid:
             key_to_gid[k] = len(key_to_gid)
         gids.append(key_to_gid[k])
@@ -732,6 +724,13 @@ def main():
     parser.add_argument("--limit", type=int, default=0,
                         help="If >0, sample only the first N reference records.")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--uniform_budget", type=int, default=0,
+                        help="Condition on each unique composition S times "
+                             "instead of once per reference record. S is a "
+                             "budget per formula as written, so Si2O4 and "
+                             "Si4O8 each get S. Writes uniform_manifest.pt "
+                             "next to the CIFs so evaluate.py can hold the "
+                             "pool to the same budget.")
     args = parser.parse_args()
 
     assert args.dataset == T.DATASET, (
@@ -772,6 +771,18 @@ def main():
     print(f"[model] loaded EMA checkpoint from {ckpt_path}", flush=True)
 
     ref_records = torch.load(str(ref_path), weights_only=False)
+    if args.uniform_budget > 0:
+        # One entry per unique composition, repeated S times: the reference
+        # multiplicity is unknown at deployment time, so every composition gets
+        # the same budget. First record of a formula wins, which makes the list
+        # deterministic given the split. Rows are formula-major, so the CIF at
+        # index i belongs to composition i // S.
+        reps: dict = {}
+        for r in ref_records:
+            reps.setdefault(_formula_key(r["atomic_numbers"].numpy()), r)
+        ref_records = [rep for rep in reps.values() for _ in range(args.uniform_budget)]
+        print(f"[uniform] {len(reps)} unique compositions x S={args.uniform_budget} "
+              f"-> {len(ref_records)} generations", flush=True)
     n_full = len(ref_records)
     if args.limit and args.limit > 0:
         ref_records = ref_records[:args.limit]
@@ -785,6 +796,9 @@ def main():
     with torch.no_grad():
         generate_cifs(model, ref_records, out_dir, device, args.steps, rng,
                       greedy=args.greedy, sg_stratify=args.sg_stratify)
+    if args.uniform_budget > 0:
+        torch.save([{"atomic_numbers": r["atomic_numbers"]} for r in ref_records],
+                   str(Path(out_dir) / "uniform_manifest.pt"))
     n_cif = len(list(Path(out_dir).glob("*.cif")))
     print(f"[done] wrote {n_cif} CIFs into {out_dir} in {time.time()-t0:.1f}s", flush=True)
     print(f"[next] score with:  python evaluate.py --samples_dir {out_dir} "
