@@ -486,6 +486,109 @@ def _one_to_one_metrics(
     return {"unfiltered": unfiltered, "filtered": filtered}
 
 
+def _formula_key(numbers: np.ndarray) -> tuple:
+    """Composition key without GCD reduction: Si2O4 and Si4O8 differ.
+
+    The uniform budget is defined on the formula as written, because that is
+    what the sampler is conditioned on. Scoring still pools by the REDUCED
+    formula -- see `_composition_key` -- so the two keys serve different steps.
+    """
+    return tuple(int(x) for x in np.sort(numbers))
+
+
+def uniform_metrics(samples_dirs, ref_file, *, budget=0, data_dir="./data",
+                    num_workers=0, enable_progress_bar=True) -> dict:
+    """METRe for a pool that holds each composition to `budget` generations.
+
+    The reference-count protocol of `compute_metrics` generates one structure
+    per reference, so its pool never exceeds the reference set and its CIFs are
+    index-aligned. A uniform budget breaks both: S generations per composition
+    is a bigger pool for S >= 2, and the CIFs may come from several directories
+    (one per i.i.d. draw of a baseline that can only sample per test record).
+
+    Each directory is read as index-aligned to `ref_file` unless it carries a
+    `uniform_manifest.pt` written by sample.py, which lists the composition each
+    CIF was conditioned on. Directories are consumed in the order given, so
+    `budget` keeps a reproducible prefix per composition.
+    """
+    ref_path = Path(data_dir) / ref_file
+    ref_records = torch.load(str(ref_path), weights_only=False)
+    ref_list = [_ref_from_record(r) for r in ref_records]
+    print(f"[data] reference split: {len(ref_records)} structures (file={ref_file})")
+
+    taken: dict = {}
+    picked = []
+    over = missing = 0
+    for d in samples_dirs:
+        d = Path(d)
+        manifest = d / "uniform_manifest.pt"
+        cond = (torch.load(str(manifest), weights_only=False) if manifest.is_file()
+                else ref_records)
+        for i, rec in enumerate(cond):
+            k = _formula_key(rec["atomic_numbers"].numpy())
+            if budget and taken.get(k, 0) >= budget:
+                over += 1
+                continue
+            f = d / f"{i:05d}.cif"
+            if not f.exists():
+                missing += 1
+                continue
+            picked.append(f)
+            taken[k] = taken.get(k, 0) + 1
+    n_comp = len(taken)
+    print(f"[pool] {len(picked)} CIFs from {len(samples_dirs)} dir(s) over {n_comp} "
+          f"compositions (budget={budget or 'all'}, {over} over budget, {missing} missing)")
+    if budget:
+        short = sum(1 for v in taken.values() if v < budget)
+        if short:
+            print(f"[pool] WARNING {short} compositions below budget {budget}")
+
+    gens, unparseable = [], 0
+    for f in picked:
+        try:
+            st = _struct_from_cif(f)
+        except Exception:
+            unparseable += 1
+            continue
+        gens.append(CrystalRecord(st, st.atomic_numbers))
+    if unparseable:
+        print(f"[gen] {unparseable} CIFs unparseable, dropped")
+    if not gens:
+        raise ValueError("no generation could be loaded")
+
+    # `metre_metrics` guards len(gen) <= len(ref): one structure per reference is
+    # the reference-count protocol, so a bigger pool is a budget bug there. Here
+    # it is the point, so score in chunks of at most len(ref) and keep the
+    # per-reference minimum -- the best over a union is the min of the bests
+    # over any partition, so this is one unchunked pass.
+    stol = 0.5
+    best = [None] * len(ref_list)
+    n_chunks = (len(gens) + len(ref_list) - 1) // len(ref_list)
+    print(f"[metre] computing METRe (stol={stol}, ltol=0.3, angle_tol=10.0) over "
+          f"{len(gens)} generations ...")
+    for c in range(n_chunks):
+        part = gens[c * len(ref_list):(c + 1) * len(ref_list)]
+        b = _best_rmsd_per_ref(
+            part, ref_list, ltol=0.3, stol=stol, angle_tol=10.0,
+            num_workers=num_workers if num_workers > 0 else None,
+            check_reduced=True, enable_progress_bar=enable_progress_bar,
+            desc=f"metre {c + 1}/{n_chunks}" if n_chunks > 1 else "metre")
+        for i, r in enumerate(b):
+            if r is not None and (best[i] is None or r < best[i]):
+                best[i] = r
+    matched = [r for r in best if r is not None]
+    return {
+        "cRMSE": float(np.mean([r if r is not None else stol for r in best])),
+        "match_rate": len(matched) / len(best),
+        "mean_rmsd": float(np.mean(matched)) if matched else float("nan"),
+        "n_matched": len(matched),
+        "n_total": len(best),
+        "n_gen": len(gens),
+        "n_comp": n_comp,
+        "ref_file": ref_file,
+    }
+
+
 def compute_metrics(samples_dir, ref_file, *, data_dir="./data", limit=0,
                     num_workers=0, enable_progress_bar=True) -> dict:
     """Load CIF samples + reference split and compute every metric in one pass.
@@ -602,8 +705,14 @@ def _print_report(result: dict) -> None:
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--samples_dir", type=str, required=True,
-                        help="Directory containing {idx:05d}.cif files.")
+    parser.add_argument("--samples_dir", type=str, required=True, action="append",
+                        help="Directory containing {idx:05d}.cif files; repeat to "
+                             "pool several draws under --uniform_budget.")
+    parser.add_argument("--uniform_budget", type=int, default=0,
+                        help="Score a uniform per-composition budget: keep the "
+                             "first S generations of each formula (as written) "
+                             "and report METRe only. 0 (default) runs the "
+                             "reference-count protocol.")
     parser.add_argument("--data_dir", type=str, default="./data")
     parser.add_argument("--dataset", type=str, default=None,
                         help="Dataset name (mp_20, mp_20_ps, mpts_52). With "
@@ -633,14 +742,32 @@ def main():
     else:
         raise SystemExit("provide --dataset (and optional --split) or --test_file")
 
+    uniform = args.uniform_budget > 0 or len(args.samples_dir) > 1
     try:
-        result = compute_metrics(
-            args.samples_dir, ref_file,
-            data_dir=args.data_dir, limit=args.limit, num_workers=args.num_workers,
-        )
+        if uniform:
+            result = uniform_metrics(
+                args.samples_dir, ref_file, budget=args.uniform_budget,
+                data_dir=args.data_dir, num_workers=args.num_workers,
+            )
+        else:
+            result = compute_metrics(
+                args.samples_dir[0], ref_file,
+                data_dir=args.data_dir, limit=args.limit, num_workers=args.num_workers,
+            )
     except (FileNotFoundError, ValueError) as e:
         raise SystemExit(str(e))
-    _print_report(result)
+    if uniform:
+        print("=" * 60)
+        print(f"uniform budget {args.uniform_budget or 'all'}  "
+              f"({result['n_gen']} generations, {result['n_comp']} compositions, "
+              f"ref={ref_file})")
+        print(f"  METRe match rate = {result['match_rate']*100:6.2f}%   "
+              f"({result['n_matched']}/{result['n_total']})")
+        print(f"  cRMSE            = {result['cRMSE']:.4f}")
+        print(f"  mean RMSD        = {result['mean_rmsd']:.4f}")
+        print("=" * 60)
+    else:
+        _print_report(result)
     return result
 
 
