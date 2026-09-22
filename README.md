@@ -56,6 +56,23 @@ python evaluate.py --samples_dir runs/mp20/<decode tag>_samples --dataset mp_20
 - `--greedy` — MAP/argmax decoding (one CIF per test entry, index-aligned).
 - `--sg_stratify` — assign distinct space groups across a composition's
   generations, for polymorph coverage.
+- `--uniform_budget S` — condition on each unique composition `S` times instead
+  of once per test record. The reference multiplicity is unknown at deployment
+  time, so every composition gets the same budget. A composition here is the
+  formula as written: Si2O4 and Si4O8 each get `S`. Writes
+  `uniform_manifest.pt` beside the CIFs so `evaluate.py` can hold the pool to
+  the same budget:
+
+```bash
+python sample.py --dataset mp_20_ps --greedy --sg_stratify --uniform_budget 5 \
+    --ckpt runs/mp20ps/best.pt --out_dir runs/mp20ps/uniform_S5
+python evaluate.py --samples_dir runs/mp20ps/uniform_S5 --uniform_budget 5 \
+    --dataset mp_20_ps --split test
+```
+
+`--samples_dir` repeats, so a baseline that can only sample once per test
+record is scored by pooling its independent draws and letting `--uniform_budget`
+trim each composition to `S`.
 
 The Wyckoff/SG tables under `precompute/` are committed; regenerate with
 `precompute_normalizer.py` / `precompute_wyckoff.py`.
@@ -63,7 +80,9 @@ The Wyckoff/SG tables under `precompute/` are committed; regenerate with
 **`evaluate.py` metrics** (tolerances `ltol=0.3, stol=0.5, angle_tol=10°`):
 
 - **METRe / cRMSE** — composition-pooled coverage (paper Table 2). Score the
-  `--sg_stratify` samples.
+  `--sg_stratify` samples. Pooling is by the *reduced* formula, which is METRe's
+  definition, while the uniform budget above counts the formula as written; the
+  two keys deliberately differ.
 - **One-to-one match rate / RMSE** — index-aligned, each test ref vs its single
   generation (paper Table 1). Score the `--greedy` samples. Reported twice:
   - *Unfiltered* — applied directly to the generations.
