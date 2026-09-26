@@ -64,7 +64,7 @@ def _peek_dataset() -> str:
 DATASET = _peek_dataset()
 
 # ----------------------------- constants ---------------------------------- #
-K_BINS = 64                  # bins per axis / lattice param
+K_BINS = _DATASETS[DATASET]["k_bins"]   # bins per axis / lattice param: 64, or 32 on mpts_52
 MASK_ID = K_BINS             # mask token id for bin streams (vocab = K_BINS + 1)
 VOCAB_SIZE = K_BINS + 1
 MAX_N = _DATASETS[DATASET]["max_n"]   # 20 (mp_20, mp_20_ps) or 52 (mpts_52)

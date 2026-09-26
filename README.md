@@ -34,7 +34,9 @@ pip install -r requirements.txt
 
 ## Usage
 
-Datasets: `mp_20`, `mp_20_ps` (MP-20 polymorph split), `mpts_52`.
+Datasets: `mp_20`, `mp_20_ps` (MP-20 polymorph split), `mpts_52`. Per-dataset
+defaults live in `configs.py`: MPTS-52 uses 32 coordinate and lattice bins per
+axis, the other two use 64.
 
 ```bash
 # 1. data (streamed from OMatG -> data/<dataset>_*.pt)
